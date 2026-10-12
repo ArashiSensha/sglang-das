@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.models import glm5_next
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+from sglang.srt.models.glm5_next_nextn import Glm5NextForConditionalGenerationNextN
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
