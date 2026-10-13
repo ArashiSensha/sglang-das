@@ -70,9 +70,10 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hcu, is_hip, is_npu
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 
 
 logger = logging.getLogger(__name__)
@@ -234,11 +235,17 @@ class _SelectorDraftSampler:
             min=1e-5,
             out=self.temperatures[:bs],
         )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+        if _is_hcu:
+            # The graph consumes this stable buffer. Write the comparison into
+            # it directly, avoiding a temporary mask and a second kernel copy
+            # on every DFLASH decode step.
+            torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=self.greedy_mask[:bs])
+        else:
+            self.greedy_mask[:bs].copy_(
+                resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+                )
             )
-        )
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
@@ -246,16 +253,29 @@ class _SelectorDraftSampler:
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
-        tokens, q_rows = self.selector.sample_path(
-            candidate_ids=candidate_ids,
-            scores=scores,
-            uniforms=self.uniforms[:bs].uniform_(),
-            temperatures=self.temperatures[:bs],
-            greedy_mask=self.greedy_mask[:bs],
-        )
-        self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+        if _is_hcu:
+            from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+
+            selector_walk_triton(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=self.uniforms[:bs].uniform_(),
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+                tokens_out=self.out[: bs * (self.block_size - 1)].view(bs, -1),
+                q_out=self.q_out[:bs],
+            )
+        else:
+            tokens, q_rows = self.selector.sample_path(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=self.uniforms[:bs].uniform_(),
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+            )
+            self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+            self.q_out[:bs].copy_(q_rows)
         self.candidate_out[:bs].copy_(candidate_ids)
-        self.q_out[:bs].copy_(q_rows)
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -1683,10 +1703,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
+            if _is_hcu:
+                # Constructing tensors directly on the GPU issues blocking H2D
+                # copies after target prefill. Stage both host length lists in
+                # one pinned allocation so the host can enqueue draft KV work
+                # without waiting for target kernels to complete.
+                lengths_cpu = torch.tensor(
+                    [batch.extend_lens, batch.prefix_lens],
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                ctx_lens, draft_seq_lens = lengths_cpu.to(
+                    device=device, non_blocking=True
+                ).unbind(0)
+            else:
+                ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(
