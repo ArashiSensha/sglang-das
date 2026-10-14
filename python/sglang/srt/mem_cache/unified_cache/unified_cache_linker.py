@@ -776,6 +776,32 @@ class UnifiedCacheLinkerWrapper:
             return component_transfers, False, error
         return component_transfers, True, None
 
+    def _build_and_agree_load_transfers(self, req, tail_hashes, prefix_len):
+        component_transfers, constructed, error = self._build_load_transfers(
+            req, tail_hashes
+        )
+        local_revalidate = getattr(self.cache_linker, "local_load_revalidator", None)
+        valid = constructed
+        if constructed and local_revalidate is not None:
+            try:
+                valid = bool(local_revalidate([t for _, t in component_transfers]))
+            except BaseException as validation_error:
+                # Even an unexpected local error must reach the agreement;
+                # otherwise peers could block forever in the reduction.
+                valid, error = False, validation_error
+        verdict = torch.tensor(int(valid), dtype=torch.int)
+        self.cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+        agreed = bool(verdict.item())
+        if not agreed:
+            self._abort_disagreed_load(
+                req,
+                component_transfers,
+                prefix_len,
+                cancel_prefetch=False,
+                pending=error,
+            )
+        return component_transfers, agreed, local_revalidate is not None
+
     def _abort_disagreed_load(
         self,
         req: Req,
@@ -833,6 +859,7 @@ class UnifiedCacheLinkerWrapper:
             return empty_indices, req.last_node
 
         prepared_from_host_prefetch = False
+        revalidated_with_construction = False
         prefetched = self.host_prefetch_hits.pop(req.rid, None) is not None
         if prefetched:
             status = self.cache_linker.get_host_prefetch_status(req.rid)
@@ -919,23 +946,10 @@ class UnifiedCacheLinkerWrapper:
                 return self.load_back(req)
             prepared_from_host_prefetch = True
         else:
-            component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes
+            component_transfers, agreed, revalidated_with_construction = (
+                self._build_and_agree_load_transfers(req, tail_hashes, prefix_len)
             )
-            all_constructed = torch.tensor(int(constructed), dtype=torch.int)
-            cache._all_reduce_attn_groups(
-                all_constructed, torch.distributed.ReduceOp.MIN
-            )
-            if int(all_constructed.item()) == 0:
-                # Each rank frees what it built; a component frees its own
-                # slots when it fails after allocating.
-                self._abort_disagreed_load(
-                    req,
-                    component_transfers,
-                    prefix_len,
-                    cancel_prefetch=False,
-                    pending=build_error,
-                )
+            if not agreed:
                 return empty_indices, req.last_node
 
         # Keys can be evicted remotely (master memory-watermark eviction)
@@ -945,6 +959,7 @@ class UnifiedCacheLinkerWrapper:
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
         if (
             not prepared_from_host_prefetch
+            and not revalidated_with_construction
             and revalidate is not None
             and not revalidate([transfer for _, transfer in component_transfers])
         ):

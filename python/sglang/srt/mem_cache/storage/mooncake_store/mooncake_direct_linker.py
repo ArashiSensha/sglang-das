@@ -663,6 +663,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         return restorable
 
+    @property
+    def local_load_revalidator(self):
+        # Metadata revalidation is local; the scheduler agrees its verdict
+        # together with construction success across the attention groups.
+        if not envs.SGLANG_MOONCAKE_FUSED_LOAD_AGREEMENT.get():
+            return None
+        return self._revalidate_load_local
+
     def revalidate_load(self, transfers: list[PoolTransfer]) -> bool:
         valid = self._revalidate_load_local(transfers)
         groups = getattr(self, "_load_revalidation_groups", ())
