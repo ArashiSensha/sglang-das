@@ -166,8 +166,19 @@ def match_prefix_for_req(
         capped = min(len(token_ids), req.external_cache_hit_length)
         key_limit = capped if key_limit is None else min(key_limit, capped)
 
-    match_result = tree_cache.match_prefix(
-        MatchPrefixParams(
+    match_params = None
+    if include_req and getattr(
+        getattr(tree_cache, "linker", None), "async_lookup_enabled", False
+    ):
+        # Priority matching must use the same capped key as lookup staging and
+        # admission. A full-input match otherwise replaces even a published miss
+        # with another query, keeping the request pending indefinitely.
+        match_params = req.prepare_external_lookup(tree_cache)
+        if match_params is not None:
+            match_params.cow_mamba = cow_mamba
+
+    if match_params is None:
+        match_params = MatchPrefixParams(
             key=RadixKey(
                 token_ids=token_ids,
                 extra_key=req.extra_key,
@@ -178,7 +189,7 @@ def match_prefix_for_req(
             req=req if include_req else None,
             return_full_match=bool(reprefill_tail),
         )
-    )
+    match_result = tree_cache.match_prefix(match_params)
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key

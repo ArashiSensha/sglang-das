@@ -576,7 +576,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.get_waiting_queue_prefetch_admission_states([rid])[rid]
 
     def get_waiting_queue_prefetch_admission_states(
-        self, rids: Sequence[str]
+        self, rids: Sequence[str], *, pending_lookup_rids: Sequence[str] = ()
     ) -> dict[str, str]:
         """Resolve variable local request lists in one fixed-shape collective round.
 
@@ -616,10 +616,19 @@ class UnifiedRadixCache(BasePrefixCache):
             "no_prefetch_needed",
             "terminal",
         )
+        # A deferred snapshot is still pending even before a background job
+        # exists. Agree on this state so another rank cannot admit it early.
+        pending_lookup_rids = set(pending_lookup_rids)
         local_states = [
-            "not_tracked"
-            if self.linker is None
-            else self.linker.get_host_prefetch_admission_state(rid)
+            (
+                "pending"
+                if rid in pending_lookup_rids
+                else (
+                    "not_tracked"
+                    if self.linker is None
+                    else self.linker.get_host_prefetch_admission_state(rid)
+                )
+            )
             for rid in all_rids
         ]
         counts = torch.tensor(
@@ -658,6 +667,31 @@ class UnifiedRadixCache(BasePrefixCache):
     def cancel_waiting_queue_prefetch(self, rid: str) -> None:
         if self.linker is not None:
             self.linker.cancel_waiting_queue_prefetch(rid)
+
+    def submit_external_lookups(self, requests: Sequence[Req]) -> bool:
+        """Stage probes on the scheduler thread without waiting or publishing.
+
+        Only the storage queries run in workers. Prefix matching and all cache
+        mutations stay on the scheduler thread, before request admission.
+        """
+        # Submit the cohort before waiting: future.result() must not be called
+        # between submissions, or the storage queries become serial again.
+        if (
+            self.linker is None
+            or not self.linker.async_lookup_enabled
+            or self.disable
+            or self.pp_size != 1
+            or envs.SGLANG_RADIX_FORCE_MISS.get()
+        ):
+            return False
+        for req in requests:
+            params = req.prepare_external_lookup(self)
+            if params is not None:
+                self.match_prefix(params)
+        return True
+
+    def is_external_lookup_pending(self, rid: str) -> bool:
+        return self.linker is not None and self.linker.has_pending_lookup(rid)
 
     def is_chunk_cache(self) -> bool:
         return self.disable
@@ -2780,19 +2814,55 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
+    def _publish_ready_external_lookups(self) -> None:
+        """Agree completed DFS probes by identity, never wait for a worker.
+
+        Ingress queues may arrive in different orders on CP/TP ranks. Intersect
+        immutable query identities before reducing their variable-length hit
+        masks, so a fast later request can pass an unfinished earlier request.
+        All communication stays on the scheduler's attention CPU groups.
+        """
+        ready_ids = self.linker.ready_lookup_ids()
+        has_ready = torch.tensor([int(bool(ready_ids))], dtype=torch.int)
+        self._all_reduce_attn_groups(has_ready, torch.distributed.ReduceOp.MIN)
+        if not int(has_ready.item()):
+            return
+
+        groups = [
+            group
+            for group in (self.attn_cp_group, self.attn_tp_group)
+            if group is not None and torch.distributed.get_world_size(group=group) > 1
+        ]
+        if not groups and self.tp_world_size > 1:
+            groups.append(self.tp_group)
+        common = set(ready_ids)
+        for group in groups:
+            gathered = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(gathered, sorted(common), group=group)
+            common = set.intersection(*(set(ids) for ids in gathered))
+        self.linker.drain_ready_lookups(sorted(common))
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
-            finish_counts = torch.tensor(
-                [
-                    self.linker.num_completed_loads(),
-                    self.linker.num_completed_offloads(),
-                ],
-                dtype=torch.int,
-                device="cpu",
+            async_lookup_enabled = self.linker.async_lookup_enabled
+            ready_publication = (
+                async_lookup_enabled and self.linker.ready_lookup_publication
             )
+            counts = [
+                self.linker.num_completed_loads(),
+                self.linker.num_completed_offloads(),
+            ]
+            if async_lookup_enabled:
+                counts.append(
+                    0 if ready_publication else self.linker.wait_pending_lookups()
+                )
+            finish_counts = torch.tensor(counts, dtype=torch.int, device="cpu")
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            counts = finish_counts.tolist()
+            load_count, offload_count = counts[0], counts[1]
+            if async_lookup_enabled:
+                self.linker.drain_lookups(counts[2])
             self._collect_failed_linker_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
@@ -2801,6 +2871,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
+            if ready_publication:
+                self._publish_ready_external_lookups()
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.
@@ -3032,8 +3104,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Compress-only HiCache: SWA is never offloaded, so a host-restored
         # prefix carries no SWA at all.
         unified_compress_only_hicache = (
-            self.cache_controller is not None
-            and not self.tree_core.has_swa_host_pool
+            self.cache_controller is not None and not self.tree_core.has_swa_host_pool
         )
         # unified_kv layout: SWA lives in a per-request ring keyed by
         # (state_slot, pos), so another request's slots are not reusable.

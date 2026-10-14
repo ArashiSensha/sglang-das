@@ -760,6 +760,8 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS = EnvInt(1)
+    SGLANG_MOONCAKE_ASYNC_LOOKUP = EnvBool(False)
     SGLANG_MOONCAKE_READ_LAYOUT = EnvBool(False)
     SGLANG_KV_FREE_PAGE_TABLE = EnvBool(False)
     SGLANG_MOONCAKE_BATCH_EXISTS = EnvBool(False)

@@ -11,7 +11,6 @@ from queue import Empty, Queue
 import torch
 
 from sglang.srt.environ import envs
-
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -410,6 +409,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             self.storage_metrics_collector = collector_cls(labels=labels)
 
+        self.async_lookup_enabled = envs.SGLANG_MOONCAKE_ASYNC_LOOKUP.get()
+        if self.async_lookup_enabled and params.pp_size != 1:
+            raise ValueError("SGLANG_MOONCAKE_ASYNC_LOOKUP currently requires PP1")
+        self.async_lookup_workers = 1
+        if self.async_lookup_enabled:
+            self.async_lookup_workers = envs.SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS.get()
+            if self.async_lookup_workers < 1:
+                raise ValueError("SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS must be >= 1")
+            logger.info(
+                "Mooncake asynchronous L3 lookup enabled (PP1, workers=%d)",
+                self.async_lookup_workers,
+            )
         self.read_layout_enabled = envs.SGLANG_MOONCAKE_READ_LAYOUT.get()
         if self.read_layout_enabled:
             if self.read_plan_enabled or self.enable_page_wise_load:
@@ -612,6 +623,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        return self._lookup_local(rid, transfers)
+
+    def lookup_in_worker(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        """Local metadata only; the wrapper publishes results on all ranks."""
+        return self._lookup_local(rid, transfers)
+
+    def _lookup_local(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -1551,9 +1569,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
