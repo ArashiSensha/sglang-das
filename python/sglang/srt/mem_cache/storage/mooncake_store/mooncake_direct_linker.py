@@ -10,6 +10,8 @@ from queue import Empty, Queue
 
 import torch
 
+from sglang.srt.environ import envs
+
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -408,6 +410,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             self.storage_metrics_collector = collector_cls(labels=labels)
 
+        self.read_layout_enabled = envs.SGLANG_MOONCAKE_READ_LAYOUT.get()
+        if self.read_layout_enabled:
+            if self.read_plan_enabled or self.enable_page_wise_load:
+                raise ValueError(
+                    "SGLANG_MOONCAKE_READ_LAYOUT requires ReadPlan and "
+                    "page-wise loading to be disabled."
+                )
+            if not callable(
+                getattr(self.storage.store, "batch_get_into_layouts", None)
+            ):
+                raise RuntimeError(
+                    "Mooncake package does not support compact layout reads"
+                )
+            from mooncake.store import ReadComponent, ReadKeyMapping, ReadLayout
+
+            self._read_layout_types = ReadComponent, ReadKeyMapping, ReadLayout
+            self._read_layout_components = {}
+            logger.info(
+                "Mooncake compact layout reads enabled (Python layer scheduling)"
+            )
         self.register_buffers()
         if self.read_plan_enabled:
             self.layer_done_counter = ReadPlanLoadCounter(self.num_layers)
@@ -1343,6 +1365,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.load_with_read_plan(counter_index, request_transfers)
                 return True
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
+            batch_locations = getattr(self, "read_layout_enabled", False)
+            pool_indices = {}
             for _rid, transfers in request_transfers:
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
@@ -1350,11 +1374,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         list(transfer.keys), transfer
                     )
                     keys.extend(self.storage._tag_keys(component_keys))
-                    locations.extend(
-                        self.pools[transfer.name].prepare_locations(
+                    if batch_locations:
+                        pool_indices.setdefault(transfer.name, []).append(
                             transfer.host_indices
                         )
-                    )
+                    else:
+                        locations.extend(
+                            self.pools[transfer.name].prepare_locations(
+                                transfer.host_indices
+                            )
+                        )
+            for name, indices in pool_indices.items():
+                batches[name][1].extend(
+                    self.pools[name].prepare_locations_batch(indices)
+                )
             if self.enable_page_wise_load and any(
                 len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
@@ -1364,6 +1397,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 return success
 
             for layer in range(self.num_layers):
+                if getattr(self, "read_layout_enabled", False):
+                    self._read_layer_layouts(batches, layer, maybe_fail)
+                    self.layer_done_counter.complete(counter_index, layer)
+                    continue
                 for name, (keys, locations) in batches.items():
                     meta = self.pools[name].get_prepared_layer_range_meta(
                         locations, layer
@@ -1398,6 +1435,79 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             for rid, _ in request_transfers:
                 self.abort_prepared_load(rid)
         return success
+
+    def _read_layer_layouts(self, batches, layer: int, maybe_fail) -> None:
+        component_type, mapping_type, layout_type = self._read_layout_types
+        layouts = []
+        expected_results = []
+        for name, (keys, locations) in batches.items():
+            pool = self.pools[name]
+            items = pool.get_layer_range_components(layer)
+            if not items:
+                continue
+            # Reuse native components while buffer addresses/layout are stable.
+            # Request-specific keys and rows are snapshotted inside ReadLayout.
+            signature = tuple(items)
+            cached = self._read_layout_components.get((name, layer))
+            if cached is None or cached[0] != signature:
+                components = [
+                    component_type(
+                        destination_base=base,
+                        destination_stride=stride,
+                        byte_count=size,
+                        source_offset=offset,
+                    )
+                    for base, stride, size, offset in items
+                ]
+                cached = signature, components
+                self._read_layout_components[name, layer] = cached
+            maybe_fail(name, f"layer={layer}")
+            layouts.append(
+                layout_type(
+                    keys=keys,
+                    rows=locations,
+                    key_mapping=(
+                        mapping_type.PER_ROW
+                        if pool.packed
+                        else mapping_type.PER_ROW_COMPONENT
+                    ),
+                    components=cached[1],
+                )
+            )
+            expected_results.append(
+                (name, len(keys), len(locations), items, pool.packed)
+            )
+        if layouts:
+            results = self.storage.store.batch_get_into_layouts(layouts)
+            # Validate byte counts before publishing layer completion so a
+            # short read cannot expose stale KV data.
+            if not isinstance(results, (list, tuple)) or len(results) != len(layouts):
+                raise RuntimeError(
+                    "Mooncake layout get returned invalid layout results"
+                )
+            for (name, count, rows, items, packed), transferred in zip(
+                expected_results, results
+            ):
+                if (
+                    not isinstance(transferred, (list, tuple))
+                    or len(transferred) != count
+                ):
+                    raise RuntimeError(
+                        f"Mooncake layout get failed for pool={name}, "
+                        f"layer={layer}: transferred={transferred}, "
+                        f"expected_count={count}"
+                    )
+                sizes = [size for _, _, size, _ in items]
+                expected = [sum(sizes)] * count if packed else sizes * rows
+                actual = (
+                    transferred if isinstance(transferred, list) else list(transferred)
+                )
+                if actual != expected:
+                    raise RuntimeError(
+                        f"Mooncake layout get failed for pool={name}, "
+                        f"layer={layer}: transferred={transferred}, "
+                        f"expected={expected}"
+                    )
 
     def _finish_prefetch_metrics(self, rids: list[str], success: bool) -> None:
         pending_load_tokens = getattr(self, "pending_load_tokens", {})
