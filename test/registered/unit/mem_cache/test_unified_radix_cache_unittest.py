@@ -2399,6 +2399,41 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), len(seq_b))
         cache.sanity_check()
 
+    def test_batched_eviction_returns_pages_before_next_allocation(self):
+        if self.cfg.has_mamba:
+            self.skipTest("FULL/SWA batching")
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_UNIFIED_EVICT_BATCH_FREE.override(enabled),
+            ):
+                cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+                seqs = [self._make_seq(i * 1000 + 1, 2) for i in range(5)]
+                for seq in seqs:
+                    self._insert(cache, allocator, req_to_token_pool, seq)
+                full_alloc = (
+                    allocator.full_attn_allocator if self.cfg.has_swa else allocator
+                )
+                before = full_alloc.available_size()
+                with mock.patch.object(
+                    full_alloc, "free", wraps=full_alloc.free
+                ) as free:
+                    result = cache.evict(EvictParams(num_tokens=sum(map(len, seqs))))
+                self.assertEqual(
+                    full_alloc.available_size(), before + result.num_tokens_evicted
+                )
+                if enabled:
+                    self.assertEqual(free.call_count, 1)
+                else:
+                    self.assertGreater(free.call_count, 1)
+                self.assertIsNone(
+                    getattr(cache, "_pending_eviction_device_frees", None)
+                )
+                self._insert(
+                    cache, allocator, req_to_token_pool, self._make_seq(9000, 2)
+                )
+                cache.sanity_check()
+
     def test_swa_evict_internal_tombstone(self):
         """SWA eviction on internal node cascades to lower-priority components."""
         if not self.cfg.has_swa:

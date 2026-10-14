@@ -727,7 +727,29 @@ class UnifiedRadixCache(BasePrefixCache):
             ComponentType.MAMBA: params.mamba_num,
             ComponentType.C128: 0,
         }
-        self._evict_components(request_by_type, tracker)
+        batch_free = (
+            envs.SGLANG_UNIFIED_EVICT_BATCH_FREE.get()
+            and not self.is_write_back
+            and getattr(self, "_pending_eviction_device_frees", None) is None
+        )
+        if batch_free:
+            self._pending_eviction_device_frees = {}
+        try:
+            self._evict_components(request_by_type, tracker)
+        finally:
+            if batch_free:
+                pending = self._pending_eviction_device_frees
+                self._pending_eviction_device_frees = None
+                # The walk selects victims from tree counters, not allocator
+                # availability. Return all pages before the caller allocates,
+                # including when the walk aborts after detaching a victim.
+                self._drain_device_frees(
+                    {
+                        ct: [values[0] if len(values) == 1 else torch.cat(values)]
+                        for ct, values in pending.items()
+                        if values
+                    }
+                )
 
         if (
             self.cache_controller is not None
@@ -1208,6 +1230,10 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         # Free per component device slots, consuming each entry as it frees.
         for ct in list(device_frees):
+            pending = getattr(self, "_pending_eviction_device_frees", None)
+            if pending is not None and ct in (ComponentType.FULL, ComponentType.SWA):
+                pending.setdefault(ct, []).extend(device_frees.pop(ct))
+                continue
             self._apply_cache_action(
                 FreeComponentDeviceSlot(device_frees.pop(ct), component_type=ct)
             )

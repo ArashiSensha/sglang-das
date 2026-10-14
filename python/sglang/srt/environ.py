@@ -455,6 +455,10 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Use membership tables for duplicate KV/SWA page reclamation checks.
+    SGLANG_KV_FREE_PAGE_TABLE = EnvBool(False)
+    # Batch FULL/SWA frees within one non-write-back eviction walk.
+    SGLANG_UNIFIED_EVICT_BATCH_FREE = EnvBool(False)
     # Use the LightOp kernel for paged KV-cache extend allocation.
     SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
@@ -760,13 +764,17 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
-    SGLANG_MOONCAKE_FUSED_LOAD_AGREEMENT = EnvBool(False)
-    SGLANG_MOONCAKE_ASYNC_SESSION_START = EnvBool(False)
-    SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS = EnvInt(1)
-    SGLANG_MOONCAKE_ASYNC_LOOKUP = EnvBool(False)
+    # Compact layout reads with batched load locations and byte-count validation.
     SGLANG_MOONCAKE_READ_LAYOUT = EnvBool(False)
-    SGLANG_KV_FREE_PAGE_TABLE = EnvBool(False)
+    # Prepare admitted requests in a dedicated session worker in any read mode.
+    SGLANG_MOONCAKE_ASYNC_SESSION_START = EnvBool(False)
+    # Merge local load revalidation with cross-rank construction agreement.
+    SGLANG_MOONCAKE_FUSED_LOAD_AGREEMENT = EnvBool(False)
+    # Merge side-pool existence RPCs while preserving trailing-window scans.
     SGLANG_MOONCAKE_BATCH_EXISTS = EnvBool(False)
+    # Probe metadata off the scheduler thread; collectives remain on it (PP1).
+    SGLANG_MOONCAKE_ASYNC_LOOKUP = EnvBool(False)
+    SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS = EnvInt(1)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
