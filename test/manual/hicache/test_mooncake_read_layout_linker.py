@@ -39,6 +39,9 @@ load_methods(
         "_read_layer_layouts",
         "load_layer_wise",
         "LayerWiseLoadCounter",
+        "ReadPlanLoadCounter",
+        "_prepare_read_plan_layouts",
+        "load_with_read_plan",
         "_prepare_expanded_load",
         "_lease_bases",
         "_rollback_session_refs_locked",
@@ -270,6 +273,357 @@ def test_partial_session_start_is_cleaned_without_reads():
         is False
     )
     assert cleaned == ["a"]  # Only successfully acquired sessions need release.
+
+
+@pytest.mark.parametrize("mode", ["layout", "range", "page"])
+def test_request_sessions_share_keys_without_deduplicating_reads(mode):
+    starts, ends, reads = [], [], []
+    store = SimpleNamespace(
+        batch_get_session_start=lambda keys: starts.append(list(keys))
+        or [0] * len(keys),
+        batch_get_session_end=lambda keys: ends.append(list(keys)) or 0,
+        batch_get_into_layouts=lambda layouts: reads.extend(
+            list(x.keys) for x in layouts
+        )
+        or layout_results(layouts),
+        batch_get_into_multi_buffer_ranges=lambda keys, ptrs, sizes, offsets: (
+            reads.append(list(keys)) or [sum(s) for s in sizes]
+        ),
+    )
+    linker = make_linker(make_pool(), store)
+    linker.pools["swa"] = make_pool()
+    linker.read_layout_enabled = mode == "layout"
+    linker.enable_page_wise_load = mode == "page"
+    linker.page_wise_load_threshold = 1
+    linker._load_page_wise = lambda index, batches, fail: reads.extend(
+        list(keys) for keys, _ in batches.values()
+    )
+    transfers = [
+        ("r1", [SimpleNamespace(name="kv", keys=["a"], host_indices=[0])]),
+        (
+            "r2",
+            [
+                SimpleNamespace(name="kv", keys=["a", "b"], host_indices=[1, 2]),
+                SimpleNamespace(name="swa", keys=["c"], host_indices=[3]),
+            ],
+        ),
+    ]
+    index = linker.layer_done_counter.update_producer()
+    assert linker.load_layer_wise(index, transfers)
+    assert starts == [["a"], ["b", "c"]]
+    assert ends == [["a", "b", "c"]]
+    assert ["a", "a", "b"] in reads
+    assert ["c"] in reads
+    assert linker.prepared_load_sessions == linker.session_refcounts == {}
+
+
+# Exercise admission-time session preparation with real background execution.
+load_methods(
+    ROOT / "storage/mooncake_store/mooncake_direct_linker.py",
+    {"load", "cancel_queued_load"},
+)
+
+
+def admission_linker(store):
+    from concurrent.futures import ThreadPoolExecutor
+
+    linker = make_linker(make_pool(), store)
+    linker.pending_loads = {}
+    linker.pending_load_tokens = {}
+    linker.page_size = 256
+    linker.pool_group = SimpleNamespace(resolve_transfers=lambda ts, **kw: ts)
+    linker.session_prepare_futures = {}
+    linker.session_prepare_executor = ThreadPoolExecutor(max_workers=1)
+    for name in ("load", "cancel_queued_load"):
+        setattr(linker, name, MethodType(SCOPE[name], linker))
+    return linker
+
+
+def test_admission_returns_while_session_start_is_blocked():
+    entered, release = threading.Event(), threading.Event()
+    starts, ends = [], []
+
+    def start(keys):
+        starts.append(list(keys))
+        entered.set()
+        assert release.wait(5)
+        return [0] * len(keys)
+
+    linker = admission_linker(
+        SimpleNamespace(
+            batch_get_session_start=start,
+            batch_get_session_end=lambda keys: ends.append(list(keys)),
+        )
+    )
+    try:
+        transfer = SimpleNamespace(keys=["shared"], name="kv")
+        assert linker.load("a", [transfer])
+        assert entered.wait(2)
+        # Admission of b must not wait for a's RPC or its session lock.
+        assert linker.load("b", [transfer])
+        release.set()
+        assert linker.session_prepare_futures["a"].result(5)
+        assert linker.session_prepare_futures["b"].result(5)
+        assert starts == [["shared"]]
+        linker.abort_prepared_load("a")
+        assert ends == []
+        linker.abort_prepared_load("b")
+        assert ends == [["shared"]]
+        assert not linker.session_refcounts
+    finally:
+        release.set()
+        linker.session_prepare_executor.shutdown(wait=True)
+
+
+def test_cancel_queued_preparation_does_not_start_session():
+    entered, release = threading.Event(), threading.Event()
+    starts, ends = [], []
+
+    def start(keys):
+        starts.append(list(keys))
+        entered.set()
+        assert release.wait(5)
+        return [0] * len(keys)
+
+    linker = admission_linker(
+        SimpleNamespace(
+            batch_get_session_start=start,
+            batch_get_session_end=lambda keys: ends.append(list(keys)),
+        )
+    )
+    try:
+        assert linker.load("a", [SimpleNamespace(keys=["a"], name="kv")])
+        assert entered.wait(2)
+        assert linker.load("b", [SimpleNamespace(keys=["b"], name="kv")])
+        # abort also acquires the session lock, so finish a from another thread.
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        assert linker.cancel_queued_load("b")
+        timer.join()
+        assert linker.session_prepare_futures["a"].result(5)
+        linker.abort_prepared_load("a")
+        assert starts == [["a"]] and ends == [["a"]]
+        assert "b" not in linker.pending_load_tokens
+    finally:
+        release.set()
+        linker.session_prepare_executor.shutdown(wait=True)
+
+
+def test_cancel_running_preparation_drains_before_cleanup():
+    entered, release = threading.Event(), threading.Event()
+    ended = []
+
+    def start(keys):
+        entered.set()
+        assert release.wait(5)
+        return [0] * len(keys)
+
+    linker = admission_linker(
+        SimpleNamespace(
+            batch_get_session_start=start,
+            batch_get_session_end=lambda keys: ended.extend(keys),
+        )
+    )
+    try:
+        assert linker.load("a", [SimpleNamespace(keys=["a"], name="kv")])
+        assert entered.wait(2)
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        assert linker.cancel_queued_load("a")
+        timer.join()
+        assert ended == ["a"]
+        assert not linker.prepared_load_sessions
+        assert not linker.session_prepare_futures
+    finally:
+        release.set()
+        linker.session_prepare_executor.shutdown(wait=True)
+
+
+def test_failed_async_preparation_uses_load_failure_channel():
+    linker = admission_linker(
+        SimpleNamespace(batch_get_session_start=lambda keys: [-1] * len(keys))
+    )
+    try:
+        transfer = SimpleNamespace(keys=["missing"], name="kv")
+        assert linker.load("a", [transfer])
+        counter = linker.layer_done_counter.update_producer()
+        assert linker.load_layer_wise(counter, [("a", [transfer])]) is False
+        assert not linker.session_prepare_futures
+        assert not linker.prepared_load_sessions
+        for future in linker.layer_done_counter.futures[counter]:
+            assert future.done() and future.exception() is not None
+    finally:
+        linker.session_prepare_executor.shutdown(wait=True)
+
+
+def test_distinct_admissions_start_distinct_sessions():
+    starts, ends = [], []
+    linker = admission_linker(
+        SimpleNamespace(
+            batch_get_session_start=lambda keys: starts.append(list(keys))
+            or [0] * len(keys),
+            batch_get_session_end=lambda keys: ends.append(list(keys)),
+        )
+    )
+    try:
+        for rid in ["a", "b"]:
+            assert linker.load(rid, [SimpleNamespace(keys=[rid], name="kv")])
+        for rid in ["a", "b"]:
+            assert linker.session_prepare_futures[rid].result(5)
+        assert starts == [["a"], ["b"]]  # Never merged into a batch start.
+        for rid in ["a", "b"]:
+            linker.abort_prepared_load(rid)
+        assert ends == [["a"], ["b"]]
+    finally:
+        linker.session_prepare_executor.shutdown(wait=True)
+
+
+def test_admission_reuses_claimed_dfs_session():
+    ends = []
+    # No start API is provided: a claimed prefetch must never start again.
+    linker = admission_linker(
+        SimpleNamespace(batch_get_session_end=lambda keys: ends.extend(keys))
+    )
+    linker.host_prefetch_enabled = True
+    linker.host_prefetch_entries["a"] = {"state": "claimed"}
+    linker.prepared_load_sessions["a"] = ["existing"]
+    linker.session_refcounts["existing"] = 1
+    try:
+        assert linker.load("a", [SimpleNamespace(keys=["existing"], name="kv")])
+        assert linker.session_prepare_futures["a"].result(5)
+        assert linker.host_prefetch_entries["a"]["state"] == "loading"
+        linker.abort_prepared_load("a")
+        assert ends == ["existing"]
+        assert not linker.host_prefetch_entries
+    finally:
+        linker.session_prepare_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("mode", ["layout", "range", "page", "plan"])
+def test_read_modes_consume_admission_sessions_without_starting_again(mode):
+    starts, ends, reads = [], [], []
+    linker = admission_linker(
+        SimpleNamespace(
+            batch_get_session_start=lambda keys: starts.append(list(keys))
+            or [0] * len(keys),
+            batch_get_session_end=lambda keys: ends.append(list(keys)),
+            batch_get_into_layouts=lambda layouts: reads.extend(
+                list(x.keys) for x in layouts
+            )
+            or layout_results(layouts),
+            batch_get_into_multi_buffer_ranges=lambda keys, ptrs, sizes, offsets: (
+                reads.append(list(keys)) or [sum(s) for s in sizes]
+            ),
+        )
+    )
+    linker.read_layout_enabled = mode == "layout"
+    linker.enable_page_wise_load = mode == "page"
+    linker.page_wise_load_threshold = 1
+    linker._load_page_wise = lambda index, batches, fail: reads.extend(
+        list(keys) for keys, _ in batches.values()
+    )
+    if mode == "plan":
+        linker.read_plan_enabled = True
+        linker.read_plan_reuse_ranges = False
+        linker.layer_done_counter = SCOPE["ReadPlanLoadCounter"](3)
+        for name in ("_prepare_read_plan_layouts", "load_with_read_plan"):
+            setattr(linker, name, MethodType(SCOPE[name], linker))
+
+        def create_plan(
+            layouts,
+            num_layers,
+            *,
+            reuse_ranges,
+            page_wise,
+            borrowed_sessions,
+            buffer_owners,
+        ):
+            # The plan must be created after preparation, with both sessions live.
+            assert set(linker.prepared_load_sessions) == {"a", "b"}
+            assert linker.session_refcounts == {"a": 1, "b": 1}
+            assert num_layers == 3
+            assert buffer_owners is linker.pools
+            assert not reuse_ranges and not page_wise and borrowed_sessions
+            return SimpleNamespace(
+                run=lambda: reads.extend(list(layout[0]) for layout in layouts)
+            )
+
+        linker.storage.store.create_read_plan = create_plan
+    try:
+        for rid in ["a", "b"]:
+            assert linker.load(
+                rid,
+                [
+                    SimpleNamespace(
+                        keys=[rid], name="kv", host_indices=torch.tensor([0])
+                    )
+                ],
+            )
+        index = linker.layer_done_counter.update_producer()
+        assert linker.load_layer_wise(index, list(linker.pending_loads.items()))
+        assert starts == [["a"], ["b"]]
+        assert ends == [["a"], ["b"]]
+        assert reads == [["a", "b"]] * (1 if mode in {"page", "plan"} else 2)
+        assert not linker.session_prepare_futures
+        assert not linker.prepared_load_sessions
+        assert not linker.session_refcounts
+    finally:
+        linker.session_prepare_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize(
+    "layout,enabled", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_session_executor_switch_is_independent_of_layout(layout, enabled):
+    path = ROOT / "storage/mooncake_store/mooncake_direct_linker.py"
+    tree = ast.parse(path.read_text())
+    assignment = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "session_prepare_executor"
+            for t in n.targets
+        )
+    )
+    created = []
+    linker = SimpleNamespace(read_layout_enabled=layout)
+    marker = object()
+
+    def executor(**kwargs):
+        created.append(kwargs)
+        return marker
+
+    ns = {
+        "self": linker,
+        "tp_rank": 0,
+        "ThreadPoolExecutor": executor,
+        "envs": SimpleNamespace(
+            SGLANG_MOONCAKE_ASYNC_SESSION_START=SimpleNamespace(get=lambda: enabled)
+        ),
+    }
+    exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(path), "exec"), ns)
+    assert (linker.session_prepare_executor is marker) == enabled
+    assert len(created) == int(enabled)
+
+
+def test_disabled_async_start_prepares_at_load_time():
+    starts, ends = [], []
+    linker = admission_linker(
+        SimpleNamespace(
+            batch_get_session_start=lambda keys: starts.append(list(keys))
+            or [0] * len(keys),
+            batch_get_session_end=lambda keys: ends.append(list(keys)),
+            batch_get_into_layouts=layout_results,
+        )
+    )
+    linker.session_prepare_executor.shutdown(wait=True)
+    linker.session_prepare_executor = None
+    assert linker.load("a", [SimpleNamespace(keys=["a"], name="kv", host_indices=[0])])
+    assert not starts and not linker.session_prepare_futures
+    index = linker.layer_done_counter.update_producer()
+    assert linker.load_layer_wise(index, list(linker.pending_loads.items()))
+    assert starts == ends == [["a"]]
 
 
 def make_index_pool(packed=True, row_span=1):

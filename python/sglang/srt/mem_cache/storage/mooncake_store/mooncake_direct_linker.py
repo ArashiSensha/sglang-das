@@ -5,7 +5,7 @@ import math
 import os
 import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from queue import Empty, Queue
 
 import torch
@@ -460,6 +460,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Mooncake's own lease base, so ages computed from it are conservative.
         self.session_lease_base: dict[str, float] = {}
         self.session_lock = threading.Lock()
+        # Submit one preparation per admitted request. A single background
+        # worker preserves the key-indexed session/refcount ordering while
+        # overlapping metadata RPCs with admission of subsequent requests.
+        # Session preparation is shared by all read modes, independent of Layout.
+        self.session_prepare_futures: dict[str, Future] = {}
+        self.session_prepare_executor = (
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"mooncake-session-tp{tp_rank}"
+            )
+            if envs.SGLANG_MOONCAKE_ASYNC_SESSION_START.get()
+            else None
+        )
         self.host_prefetch_lock = threading.Lock()
         self.host_prefetch_entries: dict[str, dict[str, object]] = {}
         self.host_prefetch_generation = 0
@@ -734,6 +746,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if pending_load_tokens is None:
             pending_load_tokens = self.pending_load_tokens = {}
         pending_load_tokens[rid] = len(logical_pages) * self.page_size
+        executor = getattr(self, "session_prepare_executor", None)
+        if executor is not None:
+            try:
+                self.session_prepare_futures[rid] = executor.submit(
+                    self._prepare_expanded_load, rid, expanded
+                )
+            except BaseException:
+                self.pending_loads.pop(rid, None)
+                pending_load_tokens.pop(rid, None)
+                raise
         return True
 
     def prepare_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -1301,6 +1323,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._rollback_session_refs_locked(keys)
 
     def abort_prepared_load(self, rid: str) -> None:
+        future = getattr(self, "session_prepare_futures", {}).pop(rid, None)
+        if future is not None and not future.cancel():
+            # Cancellation/reset must not release slots and then allow a late
+            # preparation to publish a leaked session. This wait is off the
+            # normal admission path; the load worker also uses it for cleanup.
+            try:
+                future.result()
+            except BaseException:
+                pass  # The load completion path reports preparation failures.
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
             if entry is not None and entry.get("state") in {"claimed", "loading"}:
@@ -1373,9 +1404,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         maybe_fail = arm_load_failure_injection(self.tp_rank)
         try:
             for rid, transfers in request_transfers:
-                with self.session_lock:
-                    prepared = rid in self.prepared_load_sessions
-                if not prepared and not self._prepare_expanded_load(rid, transfers):
+                future = getattr(self, "session_prepare_futures", {}).get(rid)
+                if future is not None:
+                    prepared = future.result()
+                else:
+                    with self.session_lock:
+                        prepared = rid in self.prepared_load_sessions
+                    if not prepared:
+                        prepared = self._prepare_expanded_load(rid, transfers)
+                if not prepared:
                     raise RuntimeError(
                         f"Mooncake get session preparation failed for rid={rid}."
                     )
@@ -1770,6 +1807,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         getattr(self, "pending_load_tokens", {}).clear()
         self.load_queue.join()
         self.offload_queue.join()
+        for rid in list(getattr(self, "session_prepare_futures", {})):
+            self.abort_prepared_load(rid)
         for rid in list(self.prepared_load_sessions):
             self.abort_prepared_load(rid)
         with self.host_prefetch_lock:
@@ -1788,6 +1827,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def close(self) -> None:
         self.reset()
+        executor = getattr(self, "session_prepare_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
         self.load_queue.put(None)
         self.offload_queue.put(None)
         for _ in self.host_prefetch_threads:
