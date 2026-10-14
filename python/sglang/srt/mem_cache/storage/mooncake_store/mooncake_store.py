@@ -905,25 +905,62 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # caller has to intersect these sets across ranks.
         restorable = list(range(1, kv_pages + 1))
 
-        for transfer in pool_transfers or []:
+        batched = envs.SGLANG_MOONCAKE_BATCH_EXISTS.get()
+
+        def query_pools():
+            # Lazy iteration preserves the per-pool path's early exit on misses.
+            for transfer in pool_transfers or []:
+                if not restorable:
+                    return
+                pool_keys, multiplier = self._get_hybrid_page_component_keys(
+                    keys, transfer
+                )
+                if query_all_pp and self.pp_size > 1:
+                    pool_keys = [
+                        key.replace(f"_pp{self.pp_rank}_", f"_pp{pp_rank}_")
+                        for key in pool_keys
+                        for pp_rank in range(self.pp_size)
+                    ]
+                    multiplier *= self.pp_size
+                yield transfer, pool_keys, multiplier
+
+        def query_results():
+            if not restorable:
+                return
+            if not batched:
+                for transfer, pool_keys, multiplier in query_pools():
+                    result = self._batch_exist(self._tag_keys(pool_keys))
+                    if len(result) != len(pool_keys):
+                        raise RuntimeError(
+                            "Mooncake existence response length does not match keys"
+                        )
+                    yield transfer, result, multiplier
+                return
+
+            queries = []
+            component_keys = []
+            for transfer, pool_keys, multiplier in query_pools():
+                start = len(component_keys)
+                component_keys.extend(pool_keys)
+                queries.append((transfer, start, len(component_keys), multiplier))
+            existence = (
+                self._batch_exist(self._tag_keys(component_keys))
+                if component_keys
+                else []
+            )
+            if len(existence) != len(component_keys):
+                raise RuntimeError(
+                    "Mooncake existence response length does not match keys"
+                )
+            for transfer, start, end, multiplier in queries:
+                yield transfer, existence[start:end], multiplier
+
+        for transfer, ex, key_multiplier in query_results():
             if not restorable:
                 break
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
-            )
-            if query_all_pp and self.pp_size > 1:
-                # Direct-linker keys carry an explicit _pp{rank}_ suffix.
-                # Keep all PP shards within each page's group so both full
-                # prefixes and trailing windows require every stage to hit.
-                component_keys = [
-                    key.replace(f"_pp{self.pp_rank}_", f"_pp{pp_rank}_")
-                    for key in component_keys
-                    for pp_rank in range(self.pp_size)
-                ]
-                key_multiplier *= self.pp_size
-            component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys)
-            if key_multiplier > 0:
+            if batched and key_multiplier == 1:
+                page_exists = [r == 1 for r in ex[:kv_pages]]
+            elif key_multiplier > 0:
                 page_exists = [
                     all(
                         r == 1
