@@ -124,6 +124,7 @@ def _wrapper(cache, cache_linker):
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = cache
     wrapper.cache_linker = cache_linker
+    wrapper.lookup_results = {}
     wrapper.hit_markers = {}
     wrapper.host_prefetch_hits = {}
     wrapper._update_load = MagicMock()

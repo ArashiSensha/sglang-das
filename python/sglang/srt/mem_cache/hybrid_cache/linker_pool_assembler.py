@@ -128,7 +128,31 @@ class DevicePoolEntry:
     def prepare_locations(self, indices: torch.Tensor) -> list[int]:
         return self._rows(indices)
 
-    def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
+    def prepare_locations_batch(self, indices: Sequence[torch.Tensor]) -> list[int]:
+        """Validate transfer boundaries before sharing the copy and row checks."""
+        if not indices:
+            return []
+        for item in indices:
+            if item.numel() % self.page_size:
+                raise ValueError(
+                    f"Pool {self.name} got {item.numel()} indices, expected a "
+                    f"multiple of page_size={self.page_size}."
+                )
+        first = indices[0]
+        if len(indices) == 1:
+            return self.prepare_locations(first)
+        if any(
+            item.device != first.device or item.dtype != first.dtype
+            for item in indices[1:]
+        ):
+            # Preserve per-transfer conversion semantics without type promotion.
+            return [row for item in indices for row in self.prepare_locations(item)]
+        return self.prepare_locations(
+            torch.cat([item.detach().flatten() for item in indices])
+        )
+
+    def get_layer_range_components(self, layer: int):
+        """Compact (base, row stride, bytes, source offset) metadata."""
         mapped = self.layer_mapping.get(layer)
         if mapped is None:
             return None
@@ -139,6 +163,12 @@ class DevicePoolEntry:
             for buffer_index in buffer_indices:
                 base_ptr, row_stride, size = component[buffer_index]
                 items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+        return items
+
+    def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
+        items = self.get_layer_range_components(layer)
+        if items is None:
+            return None
 
         ptrs, sizes, offsets = [], [], []
         for row in locations:
