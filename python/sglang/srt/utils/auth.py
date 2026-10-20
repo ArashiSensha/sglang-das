@@ -8,7 +8,14 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Tuple
+
+
+AuthConfigProvider = Callable[[], Optional[Tuple[Optional[str], Optional[str]]]]
+
+
+class AuthConfigNotReady(RuntimeError):
+    """The HTTP worker has not initialized its authentication configuration."""
 
 
 @dataclass(frozen=True)
@@ -151,8 +158,13 @@ def add_api_key_middleware(
     *,
     api_key: Optional[str],
     admin_api_key: Optional[str],
+    auth_config_provider: Optional[AuthConfigProvider] = None,
 ):
-    """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
+    """Add endpoint authentication, optionally resolving keys after worker startup.
+
+    A provider returns None to bypass this layer, or a key pair (including
+    (None, None)) to apply the existing auth policy. AuthConfigNotReady yields 503.
+    """
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
     from fastapi.responses import ORJSONResponse
     from starlette.requests import Request
@@ -160,14 +172,42 @@ def add_api_key_middleware(
     class _ApiKeyASGIMiddleware:
         """ASGI-native middleware to preserve client disconnect events."""
 
-        def __init__(self, app, *, api_key, admin_api_key, fastapi_app):
+        def __init__(
+            self, app, *, api_key, admin_api_key, fastapi_app, auth_config_provider
+        ):
             self.app = app
             self.api_key = api_key
             self.admin_api_key = admin_api_key
             self.fastapi_app = fastapi_app
+            self.auth_config_provider = auth_config_provider
+            # Route auth metadata is treated as immutable after the middleware stack
+            # is built. Adding ADMIN_FORCE routes or changing route auth levels later
+            # without updating this cache is unsupported. Lifespan-added routes (such
+            # as /metrics) therefore must not require ADMIN_FORCE authentication.
+            self.has_admin_force = app_has_admin_force_endpoints(fastapi_app)
 
         async def __call__(self, scope, receive, send):
             if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
+
+            api_key, admin_api_key = self.api_key, self.admin_api_key
+            if self.auth_config_provider is not None:
+                try:
+                    auth_config = self.auth_config_provider()
+                except AuthConfigNotReady:
+                    response = ORJSONResponse(
+                        content={"error": "Authentication configuration is not ready"},
+                        status_code=503,
+                    )
+                    await response(scope, receive, send)
+                    return
+                if auth_config is None:
+                    await self.app(scope, receive, send)
+                    return
+                api_key, admin_api_key = auth_config
+
+            if not api_key and not admin_api_key and not self.has_admin_force:
                 await self.app(scope, receive, send)
                 return
 
@@ -179,8 +219,8 @@ def add_api_key_middleware(
                 method=request.method,
                 path=path,
                 authorization_header=authz,
-                api_key=self.api_key,
-                admin_api_key=self.admin_api_key,
+                api_key=api_key,
+                admin_api_key=admin_api_key,
                 auth_level=level,
             )
 
@@ -205,4 +245,5 @@ def add_api_key_middleware(
         api_key=api_key,
         admin_api_key=admin_api_key,
         fastapi_app=app,
+        auth_config_provider=auth_config_provider,
     )
