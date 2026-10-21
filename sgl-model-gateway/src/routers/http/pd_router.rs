@@ -720,7 +720,23 @@ impl PDRouter {
                     break;
                 }
                 dr = &mut decode_fut, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+                    match dr {
+                        Ok(response) => decode_early = Some(Ok(response)),
+                        Err(error) => {
+                            // Decode dispatch failed; prefill may never receive
+                            // its KV destinations. Do not wait for the
+                            // prefill bootstrap timeout before allowing a retry.
+                            error!(decode_url = %decode.url(), error = ?error,
+                                "Decode dispatch failed; cancelling paired prefill request");
+                            decode.record_outcome(false);
+                            // Prefill is cancelled, not a failed worker outcome.
+                            let mut response = error::bad_gateway(
+                                "decode_server_error", format!("Decode server error: {}", error),
+                            );
+                            response.extensions_mut().insert(BreakerOutcomesRecorded);
+                            return response;
+                        }
+                    }
                 }
             }
         }
@@ -1739,6 +1755,63 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[tokio::test]
+    async fn test_decode_transport_failure_does_not_wait_for_prefill() {
+        for is_stream in [false, true] {
+            let prefill_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let prefill_addr = prefill_listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (_connection, _) = prefill_listener.accept().await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let decode_addr = closed_listener.local_addr().unwrap();
+            drop(closed_listener);
+            let mut router = create_test_pd_router();
+            router.client = Client::builder().no_proxy().build().unwrap();
+            let prefill = Arc::from(create_test_worker(
+                format!("http://{prefill_addr}"),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            ));
+            let decode = Arc::from(create_test_worker(
+                format!("http://{decode_addr}"),
+                WorkerType::Decode,
+                true,
+            ));
+            let context = PDRequestContext {
+                route: "/v1/chat/completions",
+                batch_size: None,
+                is_stream,
+                return_logprob: false,
+                request_text: None,
+                model_id: None,
+                headers: None,
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                router.execute_dual_dispatch_internal(
+                    None,
+                    json!({"messages": [{"role":"user", "content":"test"}]}),
+                    context,
+                    prefill,
+                    decode,
+                    Instant::now(),
+                ),
+            )
+            .await;
+            server.abort();
+            let response = result.expect("decode failure must not wait for prefill bootstrap");
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert!(response
+                .extensions()
+                .get::<BreakerOutcomesRecorded>()
+                .is_some());
+        }
     }
 
     #[test]
